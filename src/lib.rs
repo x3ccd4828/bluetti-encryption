@@ -4,6 +4,8 @@ extern crate alloc;
 
 use alloc::format;
 
+pub mod ffi;
+
 /// Bluetti BLE Encryption Implementation
 ///
 /// This module implements the Bluetti device encryption protocol:
