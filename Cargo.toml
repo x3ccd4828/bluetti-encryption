@@ -1,0 +1,28 @@
+[package]
+authors = ["Cristian Filipescu"]
+description = "no_std Bluetti BLE encryption protocol implementation"
+edition = "2024"
+license = "GPL-3.0-or-later"
+name = "bluetti-encryption"
+version = "0.1.0"
+
+[lib]
+name = "bluetti_encryption"
+path = "src/lib.rs"
+
+[dependencies]
+aes = { version = "0.8", default-features = false }
+cbc = { version = "0.1", default-features = false, features = [
+    "block-padding",
+] }
+heapless = "0.8"
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+hex-literal = "1.1.0"
+log = { version = "0.4", default-features = false }
+md-5 = { version = "0.10", default-features = false }
+p256 = { version = "0.14.0-rc.7", default-features = false, features = [
+    "arithmetic",
+    "ecdh",
+    "ecdsa",
+] }
+rand_core = { version = "0.10.0", default-features = false }
