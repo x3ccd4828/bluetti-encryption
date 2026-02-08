@@ -10,7 +10,8 @@ extern "C" {
 
 typedef struct BluettiContext BluettiContext;
 
-typedef int32_t (*BluettiRandomCallback)(void *user_data, uint8_t *output, size_t output_len);
+typedef int32_t (*BluettiRandomCallback)(void *user_data, uint8_t *output,
+                                         size_t output_len);
 
 enum {
   BLUETTI_FFI_OK = 0,
@@ -26,33 +27,25 @@ BluettiContext *bluetti_init(void);
 
 void bluetti_free(BluettiContext *ctx);
 
-int32_t bluetti_set_random_callback(
-    BluettiContext *ctx,
-    BluettiRandomCallback callback,
-    void *user_data
-);
+int32_t bluetti_set_random_callback(BluettiContext *ctx,
+                                    BluettiRandomCallback callback,
+                                    void *user_data);
 
-int32_t bluetti_handle_challenge(
-    BluettiContext *ctx,
-    const uint8_t *data,
-    size_t len,
-    uint8_t *out_buf,
-    size_t *out_len
-);
+int32_t bluetti_handle_challenge(BluettiContext *ctx, const uint8_t *data,
+                                 size_t len, uint8_t *out_buf, size_t *out_len);
 
-int32_t bluetti_handle_peer_pubkey(
-    BluettiContext *ctx,
-    const uint8_t *data,
-    size_t len,
-    uint8_t *out_buf,
-    size_t *out_len
-);
+int32_t bluetti_handle_peer_pubkey(BluettiContext *ctx, const uint8_t *data,
+                                   size_t len, uint8_t *out_buf,
+                                   size_t *out_len);
 
-int32_t bluetti_handle_pubkey_accepted(
-    BluettiContext *ctx,
-    const uint8_t *data,
-    size_t len
-);
+int32_t bluetti_handle_pubkey_accepted(BluettiContext *ctx, const uint8_t *data,
+                                       size_t len);
+
+int32_t bluetti_encrypt_command(BluettiContext *ctx, const uint8_t *data,
+                                size_t len, uint8_t *out_buf, size_t *out_len);
+
+int32_t bluetti_decrypt_response(BluettiContext *ctx, const uint8_t *data,
+                                 size_t len, uint8_t *out_buf, size_t *out_len);
 
 bool bluetti_is_ready(const BluettiContext *ctx);
 

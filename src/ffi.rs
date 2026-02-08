@@ -216,7 +216,21 @@ pub extern "C" fn bluetti_handle_peer_pubkey(
     // SAFETY: caller guarantees data points to `len` readable bytes.
     let input = unsafe { core::slice::from_raw_parts(data, len) };
 
-    let message = match validate_kex_message(input, MessageType::PeerPubkey) {
+    let decrypted = if Message::new(input).is_pre_key_exchange() {
+        None
+    } else {
+        match context.inner.aes_decrypt(input) {
+            Ok(frame) => Some(frame),
+            Err(_) => return BLUETTI_FFI_ERR_OPERATION_FAILED,
+        }
+    };
+
+    let message_data = match decrypted.as_ref() {
+        Some(frame) => frame.as_slice(),
+        None => input,
+    };
+
+    let message = match validate_kex_message(message_data, MessageType::PeerPubkey) {
         Ok(message) => message,
         Err(code) => return code,
     };
@@ -233,7 +247,8 @@ pub extern "C" fn bluetti_handle_peer_pubkey(
 
     match context.inner.handle_peer_pubkey(&message, &mut rng) {
         Ok(response) => copy_to_output(response.as_slice(), out_buf, out_len),
-        Err(_) => BLUETTI_FFI_ERR_RNG_FAILED,
+        Err("Failed to generate ephemeral key") => BLUETTI_FFI_ERR_RNG_FAILED,
+        Err(_) => BLUETTI_FFI_ERR_OPERATION_FAILED,
     }
 }
 
@@ -252,13 +267,91 @@ pub extern "C" fn bluetti_handle_pubkey_accepted(
     // SAFETY: caller guarantees data points to `len` readable bytes.
     let input = unsafe { core::slice::from_raw_parts(data, len) };
 
-    let message = match validate_kex_message(input, MessageType::PubkeyAccepted) {
+    let decrypted = if Message::new(input).is_pre_key_exchange() {
+        None
+    } else {
+        match context.inner.aes_decrypt(input) {
+            Ok(frame) => Some(frame),
+            Err(_) => return BLUETTI_FFI_ERR_OPERATION_FAILED,
+        }
+    };
+
+    let message_data = match decrypted.as_ref() {
+        Some(frame) => frame.as_slice(),
+        None => input,
+    };
+
+    let message = match validate_kex_message(message_data, MessageType::PubkeyAccepted) {
         Ok(message) => message,
         Err(code) => return code,
     };
 
     match context.inner.handle_pubkey_accepted(&message) {
         Ok(()) => BLUETTI_FFI_OK,
+        Err(_) => BLUETTI_FFI_ERR_OPERATION_FAILED,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bluetti_encrypt_command(
+    ctx: *mut BluettiContext,
+    data: *const u8,
+    len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if ctx.is_null() || data.is_null() {
+        return BLUETTI_FFI_ERR_NULL_POINTER;
+    }
+
+    // SAFETY: pointers are checked for null above; caller provides valid memory.
+    let context = unsafe { &mut *ctx };
+    // SAFETY: caller guarantees data points to `len` readable bytes.
+    let input = unsafe { core::slice::from_raw_parts(data, len) };
+
+    let callback = match context.random_callback {
+        Some(callback) => callback,
+        None => return BLUETTI_FFI_ERR_RNG_NOT_CONFIGURED,
+    };
+
+    let mut rng = CallbackRng {
+        callback,
+        user_data: context.random_user_data,
+    };
+
+    let mut iv_seed = [0u8; 4];
+    if rng.try_fill_bytes(&mut iv_seed).is_err() {
+        return BLUETTI_FFI_ERR_RNG_FAILED;
+    }
+
+    match context
+        .inner
+        .encrypt_modbus_command_with_seed(input, iv_seed)
+    {
+        Ok(response) => copy_to_output(response.as_slice(), out_buf, out_len),
+        Err(_) => BLUETTI_FFI_ERR_OPERATION_FAILED,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bluetti_decrypt_response(
+    ctx: *mut BluettiContext,
+    data: *const u8,
+    len: usize,
+    out_buf: *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if ctx.is_null() || data.is_null() {
+        return BLUETTI_FFI_ERR_NULL_POINTER;
+    }
+
+    // SAFETY: pointers are checked for null above; caller provides valid memory.
+    let context = unsafe { &mut *ctx };
+    // SAFETY: caller guarantees data points to `len` readable bytes.
+    let input = unsafe { core::slice::from_raw_parts(data, len) };
+
+    match context.inner.aes_decrypt(input) {
+        Ok(response) => copy_to_output(response.as_slice(), out_buf, out_len),
         Err(_) => BLUETTI_FFI_ERR_OPERATION_FAILED,
     }
 }

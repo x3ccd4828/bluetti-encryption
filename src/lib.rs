@@ -176,8 +176,34 @@ impl BluettiEncryption {
     }
 
     pub fn encrypt_modbus_command(&self, data: &[u8]) -> Result<Vec<u8, 512>, &'static str> {
+        self.encrypt_modbus_command_with_seed(data, IV_SEED)
+    }
+
+    pub fn encrypt_modbus_command_with_seed(
+        &self,
+        data: &[u8],
+        iv_seed: [u8; 4],
+    ) -> Result<Vec<u8, 512>, &'static str> {
         let key = self.secure_aes_key.as_ref().ok_or("Encryption not ready")?;
-        self.aes_encrypt(data, key, None)
+        let iv = md5_hash_16(&iv_seed);
+
+        let encrypted = self.aes_encrypt(data, key, Some(iv))?;
+        if encrypted.len() < 2 {
+            return Err("Encrypted payload too short");
+        }
+
+        let mut framed = Vec::<u8, 512>::new();
+        framed
+            .extend_from_slice(&encrypted[..2])
+            .map_err(|_| "Buffer overflow")?;
+        framed
+            .extend_from_slice(&iv_seed)
+            .map_err(|_| "Buffer overflow")?;
+        framed
+            .extend_from_slice(&encrypted[2..])
+            .map_err(|_| "Buffer overflow")?;
+
+        Ok(framed)
     }
 
     pub fn reset(&mut self) {
