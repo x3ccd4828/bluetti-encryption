@@ -9,7 +9,11 @@ version = "0.1.0"
 [lib]
 name = "bluetti_encryption"
 path = "src/lib.rs"
-crate-type = ["staticlib"]
+crate-type = ["rlib"]
+
+[features]
+default = []
+c_ffi = []
 
 [profile.release]
 opt-level = "z"

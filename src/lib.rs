@@ -1,5 +1,6 @@
 #![no_std]
 
+#[cfg(feature = "c_ffi")]
 pub mod ffi;
 
 /// Bluetti BLE Encryption Implementation
@@ -607,6 +608,7 @@ mod tests {
 }
 
 #[cfg(not(test))]
+#[cfg(feature = "c_ffi")]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
     loop {
