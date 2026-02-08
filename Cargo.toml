@@ -4,6 +4,7 @@ description = "no_std Bluetti BLE encryption protocol implementation"
 edition = "2024"
 license = "GPL-3.0-or-later"
 name = "bluetti-encryption"
+readme = "README.md"
 version = "0.1.0"
 
 [lib]
