@@ -1,9 +1,13 @@
-use alloc::boxed::Box;
 use core::ffi::c_void;
 
 use rand_core::{TryCryptoRng, TryRng};
 
 use crate::{BluettiEncryption, Message, MessageType};
+
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut c_void;
+    fn free(ptr: *mut c_void);
+}
 
 pub const BLUETTI_FFI_OK: i32 = 0;
 pub const BLUETTI_FFI_ERR_NULL_POINTER: i32 = -1;
@@ -134,7 +138,18 @@ fn validate_kex_message(data: &[u8], expected_type: MessageType) -> Result<Messa
 
 #[unsafe(no_mangle)]
 pub extern "C" fn bluetti_init() -> *mut BluettiContext {
-    Box::into_raw(Box::new(BluettiContext::new()))
+    let raw = unsafe { malloc(core::mem::size_of::<BluettiContext>()) as *mut BluettiContext };
+    if raw.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    // SAFETY: raw points to valid writable memory of size BluettiContext
+    // returned by malloc above.
+    unsafe {
+        core::ptr::write(raw, BluettiContext::new());
+    }
+
+    raw
 }
 
 #[unsafe(no_mangle)]
@@ -266,8 +281,9 @@ pub extern "C" fn bluetti_free(ctx: *mut BluettiContext) {
     }
 
     // SAFETY: ctx must be a pointer previously returned by bluetti_init and not
-    // yet freed.
+    // yet freed. We drop the Rust value, then return raw storage to C allocator.
     unsafe {
-        drop(Box::from_raw(ctx));
+        core::ptr::drop_in_place(ctx);
+        free(ctx.cast());
     }
 }

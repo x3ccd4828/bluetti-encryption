@@ -1,7 +1,5 @@
 #![no_std]
 
-extern crate alloc;
-
 pub mod ffi;
 
 /// Bluetti BLE Encryption Implementation
@@ -605,5 +603,13 @@ mod tests {
             .expect_err("short frame must be rejected");
 
         assert_eq!(error, "Data too short");
+    }
+}
+
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    loop {
+        core::hint::spin_loop();
     }
 }

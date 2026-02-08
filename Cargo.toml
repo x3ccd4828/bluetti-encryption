@@ -9,6 +9,16 @@ version = "0.1.0"
 [lib]
 name = "bluetti_encryption"
 path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
 
 [dependencies]
 aes = { version = "0.8", default-features = false }
