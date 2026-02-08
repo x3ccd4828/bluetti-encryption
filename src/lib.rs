@@ -507,3 +507,103 @@ fn hexsum(data: &[u8], size: usize) -> Vec<u8, 4> {
     let _ = result.extend_from_slice(&bytes[start..]);
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_incomplete_frame_has_no_data_and_invalid_checksum() {
+        let frame = [
+            KEX_MAGIC[0],
+            KEX_MAGIC[1],
+            MessageType::Challenge as u8,
+            CHALLENGE_LEN as u8,
+            0xAA,
+        ];
+        let message = Message::new(&frame);
+
+        assert_eq!(message.data(), &[]);
+        assert_eq!(message.message_type(), Some(MessageType::Challenge));
+        assert!(!message.verify_checksum());
+    }
+
+    #[test]
+    fn message_parses_type_data_and_checksum_for_valid_packet() {
+        let payload = [1u8, 2, 3, 4];
+        let packet = build_kex_packet::<256>(MessageType::Challenge as u8, &payload)
+            .expect("valid packet must be created");
+
+        let message = Message::new(packet.as_slice());
+
+        assert!(message.is_pre_key_exchange());
+        assert_eq!(message.message_type(), Some(MessageType::Challenge));
+        assert_eq!(message.data(), &payload);
+        assert!(message.verify_checksum());
+    }
+
+    #[test]
+    fn message_checksum_fails_when_packet_is_tampered() {
+        let payload = [9u8, 8, 7, 6];
+        let mut packet = build_kex_packet::<256>(MessageType::PeerPubkey as u8, &payload)
+            .expect("valid packet must be created");
+
+        let last_index = packet.len() - 1;
+        packet[last_index] ^= 0xFF;
+
+        let message = Message::new(packet.as_slice());
+        assert!(!message.verify_checksum());
+    }
+
+    #[test]
+    fn aes_encrypt_decrypt_roundtrip_unsecure_mode() {
+        let key = [0x11u8; AES_BLOCK_SIZE];
+        let iv = [0x22u8; AES_BLOCK_SIZE];
+        let plaintext = [0x10u8, 0x20, 0x30, 0x40, 0x50];
+
+        let mut encryption = BluettiEncryption::new();
+        encryption.unsecure_aes_key = Some(key);
+        encryption.unsecure_aes_iv = Some(iv);
+
+        let encrypted = encryption
+            .aes_encrypt(&plaintext, &key, Some(iv))
+            .expect("encryption should succeed");
+        let decrypted = encryption
+            .aes_decrypt(encrypted.as_slice())
+            .expect("decryption should succeed");
+
+        assert_eq!(decrypted.as_slice(), &plaintext);
+    }
+
+    #[test]
+    fn aes_encrypt_decrypt_roundtrip_secure_mode() {
+        let key = [0x33u8; 32];
+        let plaintext = [
+            0xABu8, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAA, 0xBB, 0xCC,
+        ];
+
+        let mut encryption = BluettiEncryption::new();
+        encryption.secure_aes_key = Some(key);
+
+        let encrypted = encryption
+            .aes_encrypt(&plaintext, &key, None)
+            .expect("encryption should succeed");
+        let decrypted = encryption
+            .aes_decrypt(encrypted.as_slice())
+            .expect("decryption should succeed");
+
+        assert_eq!(decrypted.as_slice(), &plaintext);
+    }
+
+    #[test]
+    fn aes_decrypt_rejects_too_short_input() {
+        let encryption = BluettiEncryption::new();
+        let too_short = [0u8; 5];
+
+        let error = encryption
+            .aes_decrypt(&too_short)
+            .expect_err("short frame must be rejected");
+
+        assert_eq!(error, "Data too short");
+    }
+}
