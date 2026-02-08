@@ -2,8 +2,6 @@
 
 extern crate alloc;
 
-use alloc::format;
-
 pub mod ffi;
 
 /// Bluetti BLE Encryption Implementation
@@ -42,6 +40,21 @@ const PUBLIC_KEY_K2_BYTES: [u8; 91] = hex_literal::hex!(
 
 const KEX_MAGIC: [u8; 2] = [0x2A, 0x2A];
 const AES_BLOCK_SIZE: usize = 16;
+const CHECKSUM_SIZE: usize = 2;
+const KEX_TYPE_OFFSET: usize = 2;
+const KEX_BODY_OFFSET: usize = 2;
+const KEX_DATA_OFFSET: usize = 4;
+const CHALLENGE_LEN: usize = 4;
+const PUBKEY_LEN: usize = 64;
+const SIGNATURE_LEN: usize = 64;
+const PEER_PUBKEY_PAYLOAD_LEN: usize = PUBKEY_LEN + SIGNATURE_LEN;
+const SEC1_UNCOMPRESSED_PUBKEY_LEN: usize = PUBKEY_LEN + 1;
+const SEC1_UNCOMPRESSED_TAG: u8 = 0x04;
+const CHALLENGE_RESPONSE_TYPE: u8 = 0x02;
+const LOCAL_PUBKEY_TYPE: u8 = 0x05;
+const CHALLENGE_IV_RESPONSE_START: usize = 8;
+const CHALLENGE_IV_RESPONSE_END: usize = 12;
+const IV_SEED: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -74,45 +87,42 @@ impl<'a> Message<'a> {
     }
 
     pub fn is_pre_key_exchange(&self) -> bool {
-        self.buffer.len() >= 2 && self.buffer[0..2] == KEX_MAGIC
+        self.buffer.starts_with(&KEX_MAGIC)
     }
 
     pub fn message_type(&self) -> Option<MessageType> {
-        if self.buffer.len() >= 3 {
-            MessageType::from_u8(self.buffer[2])
-        } else {
-            None
-        }
+        self.buffer
+            .get(KEX_TYPE_OFFSET)
+            .copied()
+            .and_then(MessageType::from_u8)
     }
 
     pub fn data(&self) -> &[u8] {
-        if self.buffer.len() > 4 {
-            let end = self.buffer.len() - 2;
-            &self.buffer[4..end]
-        } else {
-            &[]
-        }
+        self.slice_without_checksum(KEX_DATA_OFFSET)
     }
 
     pub fn body(&self) -> &[u8] {
-        if self.buffer.len() > 4 {
-            let end = self.buffer.len() - 2;
-            &self.buffer[2..end]
-        } else {
-            &[]
-        }
+        self.slice_without_checksum(KEX_BODY_OFFSET)
     }
 
     pub fn verify_checksum(&self) -> bool {
-        if self.buffer.len() < 4 {
+        if self.buffer.len() < KEX_DATA_OFFSET {
             return false;
         }
 
-        let body = self.body();
-        let checksum = &self.buffer[self.buffer.len() - 2..];
-        let computed = hexsum(body, 2);
+        let Some(checksum_start) = self.buffer.len().checked_sub(CHECKSUM_SIZE) else {
+            return false;
+        };
+
+        let checksum = &self.buffer[checksum_start..];
+        let computed = hexsum(self.body(), CHECKSUM_SIZE);
 
         computed == checksum
+    }
+
+    fn slice_without_checksum(&self, start: usize) -> &[u8] {
+        let end = self.buffer.len().saturating_sub(CHECKSUM_SIZE);
+        self.buffer.get(start..end).unwrap_or(&[])
     }
 }
 
@@ -122,6 +132,27 @@ pub struct BluettiEncryption {
     my_secret: Option<EphemeralSecret>,
     peer_pubkey: Option<PublicKey>,
     secure_aes_key: Option<[u8; 32]>,
+}
+
+enum CipherKey<'a> {
+    Aes128(&'a [u8; 16]),
+    Aes256(&'a [u8; 32]),
+}
+
+impl<'a> CipherKey<'a> {
+    fn from_slice(key: &'a [u8]) -> Result<Self, &'static str> {
+        if let Ok(key_256) = <&[u8; 32]>::try_from(key) {
+            return Ok(Self::Aes256(key_256));
+        }
+
+        let key_128: &[u8; 16] = key
+            .get(..AES_BLOCK_SIZE)
+            .ok_or("Invalid AES key length")?
+            .try_into()
+            .map_err(|_| "Invalid AES key length")?;
+
+        Ok(Self::Aes128(key_128))
+    }
 }
 
 impl Default for BluettiEncryption {
@@ -159,41 +190,25 @@ impl BluettiEncryption {
     }
 
     pub fn handle_challenge(&mut self, message: &Message) -> Result<Vec<u8, 256>, &'static str> {
-        let data = message.data();
-        if data.len() != 4 {
-            return Err("Invalid challenge length");
-        }
-
-        let mut reversed = [0u8; 4];
-        reversed.copy_from_slice(data);
+        let mut reversed: [u8; CHALLENGE_LEN] = message
+            .data()
+            .try_into()
+            .map_err(|_| "Invalid challenge length")?;
         reversed.reverse();
 
-        let mut hasher = Md5::new();
-        hasher.update(reversed);
-        let iv = hasher.finalize();
-        let mut unsecure_iv = [0u8; 16];
-        unsecure_iv.copy_from_slice(&iv);
-        self.unsecure_aes_iv = Some(unsecure_iv);
+        let unsecure_iv = md5_hash_16(&reversed);
+        let unsecure_key = xor_16(&unsecure_iv, &LOCAL_AES_KEY);
 
-        let mut unsecure_key = [0u8; 16];
-        for i in 0..16 {
-            unsecure_key[i] = unsecure_iv[i] ^ LOCAL_AES_KEY[i];
-        }
+        self.unsecure_aes_iv = Some(unsecure_iv);
         self.unsecure_aes_key = Some(unsecure_key);
 
         log::info!("Unsecure IV:  {:02x?}", unsecure_iv);
         log::info!("Unsecure Key: {:02x?}", unsecure_key);
 
-        let mut response = Vec::new();
-        let _ = response.extend_from_slice(&KEX_MAGIC);
-        let _ = response.push(0x02);
-        let _ = response.push(0x04);
-        let _ = response.extend_from_slice(&unsecure_iv[8..12]);
-
-        let checksum = hexsum(&response[2..], 2);
-        let _ = response.extend_from_slice(&checksum);
-
-        Ok(response)
+        build_kex_packet::<256>(
+            CHALLENGE_RESPONSE_TYPE,
+            &unsecure_iv[CHALLENGE_IV_RESPONSE_START..CHALLENGE_IV_RESPONSE_END],
+        )
     }
 
     pub fn handle_peer_pubkey<R>(
@@ -205,18 +220,17 @@ impl BluettiEncryption {
         R: rand_core::TryCryptoRng,
     {
         let data = message.data();
-        if data.len() != 128 {
+        if data.len() != PEER_PUBKEY_PAYLOAD_LEN {
             return Err("Invalid peer pubkey length");
         }
 
-        let pubkey_bytes = &data[0..64];
-        let signature_bytes = &data[64..128];
+        let (pubkey_bytes, signature_bytes) = data.split_at(PUBKEY_LEN);
 
         let unsecure_iv = self.unsecure_aes_iv.ok_or("No unsecure IV")?;
         self.verify_peer_signature(pubkey_bytes, signature_bytes, &unsecure_iv)?;
 
-        let mut pubkey_with_prefix = [0u8; 65];
-        pubkey_with_prefix[0] = 0x04;
+        let mut pubkey_with_prefix = [0u8; SEC1_UNCOMPRESSED_PUBKEY_LEN];
+        pubkey_with_prefix[0] = SEC1_UNCOMPRESSED_TAG;
         pubkey_with_prefix[1..].copy_from_slice(pubkey_bytes);
 
         let peer_key = PublicKey::from_sec1_bytes(&pubkey_with_prefix)
@@ -231,28 +245,26 @@ impl BluettiEncryption {
         self.my_secret = Some(secret);
 
         let my_pubkey_bytes = public.to_sec1_point(false);
-        let my_pubkey_untagged = my_pubkey_bytes.as_bytes();
-        let my_pubkey_64 = &my_pubkey_untagged[1..65];
+        let my_pubkey_64 = my_pubkey_bytes
+            .as_bytes()
+            .get(1..SEC1_UNCOMPRESSED_PUBKEY_LEN)
+            .ok_or("Invalid local public key length")?;
 
         let signing_key =
             SigningKey::from_bytes(&PRIVATE_KEY_L1.into()).map_err(|_| "Invalid signing key")?;
 
-        let mut to_sign = Vec::<u8, 80>::new();
-        let _ = to_sign.extend_from_slice(my_pubkey_64);
-        let _ = to_sign.extend_from_slice(&unsecure_iv);
+        let mut signed_data = [0u8; PUBKEY_LEN + AES_BLOCK_SIZE];
+        signed_data[..PUBKEY_LEN].copy_from_slice(my_pubkey_64);
+        signed_data[PUBKEY_LEN..].copy_from_slice(&unsecure_iv);
 
-        let signature: Signature = signing_key.sign(&to_sign);
+        let signature: Signature = signing_key.sign(&signed_data);
         let sig_bytes = signature.to_bytes();
 
-        let mut body = Vec::<u8, 256>::new();
-        let _ = body.extend_from_slice(&KEX_MAGIC);
-        let _ = body.push(0x05);
-        let _ = body.push(0x80);
-        let _ = body.extend_from_slice(my_pubkey_64);
-        let _ = body.extend_from_slice(&sig_bytes[..]);
+        let mut payload = [0u8; PEER_PUBKEY_PAYLOAD_LEN];
+        payload[..PUBKEY_LEN].copy_from_slice(my_pubkey_64);
+        payload[PUBKEY_LEN..].copy_from_slice(&sig_bytes[..]);
 
-        let checksum = hexsum(&body[2..], 2);
-        let _ = body.extend_from_slice(&checksum);
+        let body = build_kex_packet::<256>(LOCAL_PUBKEY_TYPE, &payload)?;
 
         let unsecure_key = self.unsecure_aes_key.ok_or("No unsecure key")?;
         self.aes_encrypt(&body, &unsecure_key, Some(unsecure_iv))
@@ -285,68 +297,17 @@ impl BluettiEncryption {
 
         let data_len = ((data[0] as usize) << 8) | (data[1] as usize);
 
-        if self.secure_aes_key.is_some() {
-            let mut hasher = Md5::new();
-            hasher.update(&data[2..6]);
-            let iv_hash = hasher.finalize();
-            let mut iv = [0u8; 16];
-            iv.copy_from_slice(&iv_hash);
-
-            let key = self.secure_aes_key.as_ref().ok_or("No secure key")?;
-
-            let encrypted = &data[6..];
-            if !encrypted.len().is_multiple_of(AES_BLOCK_SIZE) {
-                return Err("Data not aligned on AES block size");
-            }
-
-            let mut buffer = Vec::<u8, 512>::new();
-            buffer
-                .extend_from_slice(encrypted)
-                .map_err(|_| "Buffer overflow")?;
-
-            let decryptor = Decryptor::<Aes256>::new_from_slices(key, &iv)
-                .map_err(|_| "Failed to create AES-256 decryptor")?;
-
-            let decrypted = decryptor
-                .decrypt_padded_mut::<NoPadding>(&mut buffer)
-                .map_err(|_| "Decryption failed")?;
-
-            let mut result = Vec::new();
-            result
-                .extend_from_slice(&decrypted[..data_len.min(decrypted.len())])
-                .map_err(|_| "Buffer overflow")?;
-
-            log::debug!("Decrypted: {:02x?}", result.as_slice());
-            Ok(result)
+        let decrypted = if let Some(key) = self.secure_aes_key.as_ref() {
+            let iv = md5_hash_16(&data[2..6]);
+            decrypt_payload(&data[6..], data_len, CipherKey::Aes256(key), &iv)?
         } else {
             let key = self.unsecure_aes_key.as_ref().ok_or("No unsecure key")?;
             let iv = self.unsecure_aes_iv.ok_or("No unsecure IV")?;
+            decrypt_payload(&data[2..], data_len, CipherKey::Aes128(key), &iv)?
+        };
 
-            let encrypted = &data[2..];
-            if !encrypted.len().is_multiple_of(AES_BLOCK_SIZE) {
-                return Err("Data not aligned on AES block size");
-            }
-
-            let mut buffer = Vec::<u8, 512>::new();
-            buffer
-                .extend_from_slice(encrypted)
-                .map_err(|_| "Buffer overflow")?;
-
-            let decryptor = Decryptor::<Aes128>::new_from_slices(&key[..], &iv)
-                .map_err(|_| "Failed to create AES-128 decryptor")?;
-
-            let decrypted = decryptor
-                .decrypt_padded_mut::<NoPadding>(&mut buffer)
-                .map_err(|_| "Decryption failed")?;
-
-            let mut result = Vec::new();
-            result
-                .extend_from_slice(&decrypted[..data_len.min(decrypted.len())])
-                .map_err(|_| "Buffer overflow")?;
-
-            log::debug!("Decrypted: {:02x?}", result.as_slice());
-            Ok(result)
-        }
+        log::debug!("Decrypted: {:02x?}", decrypted.as_slice());
+        Ok(decrypted)
     }
 
     pub fn aes_encrypt(
@@ -355,9 +316,9 @@ impl BluettiEncryption {
         key: &[u8],
         iv_opt: Option<[u8; 16]>,
     ) -> Result<Vec<u8, 512>, &'static str> {
+        let mut result = Vec::<u8, 512>::new();
         let data_len = data.len();
 
-        let mut result = Vec::new();
         result
             .push((data_len >> 8) as u8)
             .map_err(|_| "Buffer overflow")?;
@@ -365,56 +326,23 @@ impl BluettiEncryption {
             .push((data_len & 0xFF) as u8)
             .map_err(|_| "Buffer overflow")?;
 
-        let iv = if let Some(iv_fixed) = iv_opt {
-            iv_fixed
-        } else {
-            let iv_seed = [0x12, 0x34, 0x56, 0x78];
-            result
-                .extend_from_slice(&iv_seed)
-                .map_err(|_| "Buffer overflow")?;
+        let iv = match iv_opt {
+            Some(iv) => iv,
+            None => {
+                result
+                    .extend_from_slice(&IV_SEED)
+                    .map_err(|_| "Buffer overflow")?;
 
-            let mut hasher = Md5::new();
-            hasher.update(iv_seed);
-            let iv_hash = hasher.finalize();
-            let mut iv = [0u8; 16];
-            iv.copy_from_slice(&iv_hash);
-            iv
+                md5_hash_16(&IV_SEED)
+            }
         };
 
-        let padding = (AES_BLOCK_SIZE - data_len % AES_BLOCK_SIZE) % AES_BLOCK_SIZE;
-        let mut padded = Vec::<u8, 512>::new();
-        padded
-            .extend_from_slice(data)
+        let mut buffer = zero_pad(data)?;
+        let encrypted = encrypt_payload(&mut buffer, CipherKey::from_slice(key)?, &iv)?;
+
+        result
+            .extend_from_slice(encrypted)
             .map_err(|_| "Buffer overflow")?;
-        for _ in 0..padding {
-            padded.push(0).map_err(|_| "Buffer overflow")?;
-        }
-
-        let mut buffer = padded.clone();
-
-        if key.len() == 32 {
-            let encryptor = Encryptor::<Aes256>::new_from_slices(key, &iv)
-                .map_err(|_| "Failed to create AES-256 encryptor")?;
-
-            let encrypted = encryptor
-                .encrypt_padded_mut::<NoPadding>(&mut buffer, padded.len())
-                .map_err(|_| "Encryption failed")?;
-
-            result
-                .extend_from_slice(encrypted)
-                .map_err(|_| "Buffer overflow")?;
-        } else {
-            let encryptor = Encryptor::<Aes128>::new_from_slices(&key[..16], &iv)
-                .map_err(|_| "Failed to create AES-128 encryptor")?;
-
-            let encrypted = encryptor
-                .encrypt_padded_mut::<NoPadding>(&mut buffer, padded.len())
-                .map_err(|_| "Encryption failed")?;
-
-            result
-                .extend_from_slice(encrypted)
-                .map_err(|_| "Buffer overflow")?;
-        }
 
         log::debug!("Encrypted: {:02x?}", result.as_slice());
         Ok(result)
@@ -426,21 +354,27 @@ impl BluettiEncryption {
         signature: &[u8],
         iv: &[u8],
     ) -> Result<(), &'static str> {
-        let k2_bytes = &PUBLIC_KEY_K2_BYTES[PUBLIC_KEY_K2_BYTES.len() - 64..];
-        let mut k2_with_prefix = [0u8; 65];
-        k2_with_prefix[0] = 0x04;
+        if pubkey.len() != PUBKEY_LEN
+            || signature.len() != SIGNATURE_LEN
+            || iv.len() != AES_BLOCK_SIZE
+        {
+            return Err("Invalid signature payload");
+        }
+
+        let k2_bytes = PUBLIC_KEY_K2_BYTES
+            .get(PUBLIC_KEY_K2_BYTES.len() - PUBKEY_LEN..)
+            .ok_or("Invalid K2 key")?;
+
+        let mut k2_with_prefix = [0u8; SEC1_UNCOMPRESSED_PUBKEY_LEN];
+        k2_with_prefix[0] = SEC1_UNCOMPRESSED_TAG;
         k2_with_prefix[1..].copy_from_slice(k2_bytes);
 
         let verifying_key =
             VerifyingKey::from_sec1_bytes(&k2_with_prefix).map_err(|_| "Invalid K2 key")?;
 
-        let mut signed_data = Vec::<u8, 80>::new();
-        signed_data
-            .extend_from_slice(pubkey)
-            .map_err(|_| "Buffer overflow")?;
-        signed_data
-            .extend_from_slice(iv)
-            .map_err(|_| "Buffer overflow")?;
+        let mut signed_data = [0u8; PUBKEY_LEN + AES_BLOCK_SIZE];
+        signed_data[..PUBKEY_LEN].copy_from_slice(pubkey);
+        signed_data[PUBKEY_LEN..].copy_from_slice(iv);
 
         let sig = Signature::from_slice(signature).map_err(|_| "Invalid signature format")?;
 
@@ -452,12 +386,124 @@ impl BluettiEncryption {
     }
 }
 
-fn hexsum(data: &[u8], size: usize) -> Vec<u8, 4> {
-    let sum: u32 = data.iter().map(|&b| b as u32).sum();
-    let hex_str = format!("{:0width$x}", sum, width = size * 2);
+fn build_kex_packet<const N: usize>(
+    message_type: u8,
+    payload: &[u8],
+) -> Result<Vec<u8, N>, &'static str> {
+    let payload_len = u8::try_from(payload.len()).map_err(|_| "Payload too large")?;
 
-    let mut result = Vec::new();
-    let bytes = hex::decode(&hex_str).unwrap_or_default();
-    let _ = result.extend_from_slice(&bytes);
+    let mut packet = Vec::<u8, N>::new();
+    packet
+        .extend_from_slice(&KEX_MAGIC)
+        .map_err(|_| "Buffer overflow")?;
+    packet.push(message_type).map_err(|_| "Buffer overflow")?;
+    packet.push(payload_len).map_err(|_| "Buffer overflow")?;
+    packet
+        .extend_from_slice(payload)
+        .map_err(|_| "Buffer overflow")?;
+
+    let checksum = hexsum(&packet[KEX_BODY_OFFSET..], CHECKSUM_SIZE);
+    packet
+        .extend_from_slice(&checksum)
+        .map_err(|_| "Buffer overflow")?;
+
+    Ok(packet)
+}
+
+fn md5_hash_16(input: &[u8]) -> [u8; AES_BLOCK_SIZE] {
+    let mut hasher = Md5::new();
+    hasher.update(input);
+
+    let digest = hasher.finalize();
+    let mut output = [0u8; AES_BLOCK_SIZE];
+    output.copy_from_slice(&digest);
+    output
+}
+
+fn xor_16(lhs: &[u8; AES_BLOCK_SIZE], rhs: &[u8; AES_BLOCK_SIZE]) -> [u8; AES_BLOCK_SIZE] {
+    let mut output = [0u8; AES_BLOCK_SIZE];
+
+    for (dst, (&left, &right)) in output.iter_mut().zip(lhs.iter().zip(rhs.iter())) {
+        *dst = left ^ right;
+    }
+
+    output
+}
+
+fn decrypt_payload(
+    encrypted: &[u8],
+    data_len: usize,
+    key: CipherKey<'_>,
+    iv: &[u8; AES_BLOCK_SIZE],
+) -> Result<Vec<u8, 512>, &'static str> {
+    if !encrypted.len().is_multiple_of(AES_BLOCK_SIZE) {
+        return Err("Data not aligned on AES block size");
+    }
+
+    let mut buffer = Vec::<u8, 512>::new();
+    buffer
+        .extend_from_slice(encrypted)
+        .map_err(|_| "Buffer overflow")?;
+
+    let decrypted = match key {
+        CipherKey::Aes256(key) => Decryptor::<Aes256>::new_from_slices(key, iv)
+            .map_err(|_| "Failed to create AES-256 decryptor")?
+            .decrypt_padded_mut::<NoPadding>(&mut buffer)
+            .map_err(|_| "Decryption failed")?,
+        CipherKey::Aes128(key) => Decryptor::<Aes128>::new_from_slices(key, iv)
+            .map_err(|_| "Failed to create AES-128 decryptor")?
+            .decrypt_padded_mut::<NoPadding>(&mut buffer)
+            .map_err(|_| "Decryption failed")?,
+    };
+
+    let mut result = Vec::<u8, 512>::new();
+    result
+        .extend_from_slice(&decrypted[..data_len.min(decrypted.len())])
+        .map_err(|_| "Buffer overflow")?;
+
+    Ok(result)
+}
+
+fn zero_pad(data: &[u8]) -> Result<Vec<u8, 512>, &'static str> {
+    let mut padded = Vec::<u8, 512>::new();
+    padded
+        .extend_from_slice(data)
+        .map_err(|_| "Buffer overflow")?;
+
+    let padding = (AES_BLOCK_SIZE - data.len() % AES_BLOCK_SIZE) % AES_BLOCK_SIZE;
+    for _ in 0..padding {
+        padded.push(0).map_err(|_| "Buffer overflow")?;
+    }
+
+    Ok(padded)
+}
+
+fn encrypt_payload<'a>(
+    buffer: &'a mut Vec<u8, 512>,
+    key: CipherKey<'_>,
+    iv: &[u8; AES_BLOCK_SIZE],
+) -> Result<&'a [u8], &'static str> {
+    let plain_len = buffer.len();
+
+    match key {
+        CipherKey::Aes256(key) => Encryptor::<Aes256>::new_from_slices(key, iv)
+            .map_err(|_| "Failed to create AES-256 encryptor")?
+            .encrypt_padded_mut::<NoPadding>(buffer, plain_len)
+            .map_err(|_| "Encryption failed"),
+        CipherKey::Aes128(key) => Encryptor::<Aes128>::new_from_slices(key, iv)
+            .map_err(|_| "Failed to create AES-128 encryptor")?
+            .encrypt_padded_mut::<NoPadding>(buffer, plain_len)
+            .map_err(|_| "Encryption failed"),
+    }
+}
+
+fn hexsum(data: &[u8], size: usize) -> Vec<u8, 4> {
+    let sum: u32 = data.iter().map(|&b| u32::from(b)).sum();
+    let bytes = sum.to_be_bytes();
+    let count = size.min(bytes.len());
+
+    let mut result = Vec::<u8, 4>::new();
+    let start = bytes.len() - count;
+    let _ = result.extend_from_slice(&bytes[start..]);
     result
 }

@@ -16,7 +16,6 @@ cbc = { version = "0.1", default-features = false, features = [
     "block-padding",
 ] }
 heapless = "0.8"
-hex = { version = "0.4", default-features = false, features = ["alloc"] }
 hex-literal = "1.1.0"
 log = { version = "0.4", default-features = false }
 md-5 = { version = "0.10", default-features = false }
